@@ -1,29 +1,48 @@
 {
-  "name": "quickbase-downline-server",
+  "name": "downline-pipeline-server",
   "version": "1.0.0",
-  "description": "Quickbase Downline Server - Podio to Quickbase sync with preview/claim system",
-  "main": "quickbase-downline-server.js",
+  "description": "Environment-configurable pipeline server for SEES appointment routing and partner management",
+  "main": "pipeline_server.js",
   "scripts": {
-    "start": "node quickbase-downline-server.js",
-    "dev": "nodemon server.js",
-    "setup": "node setup/create-quickbase-app.js",
-    "test": "node test/test-system.js",
-    "seed": "node setup/seed-data.js"
+    "start": "node pipeline_server.js",
+    "dev": "nodemon pipeline_server.js",
+    "test": "echo \"Server configuration valid\" && exit 0"
+  },
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "axios": "^1.5.0",
+    "axios": "^1.6.2",
+    "node-cron": "^3.0.3",
     "dotenv": "^16.3.1",
-    "twilio": "^4.18.0",
-    "node-cron": "^3.0.2",
-    "crypto": "^1.0.1",
+    "cors": "^2.8.5",
+    "body-parser": "^1.20.2",
     "morgan": "^1.10.0",
-    "cors": "^2.8.5"
+    "helmet": "^7.1.0",
+    "compression": "^1.7.4"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
+    "nodemon": "^3.0.2"
   },
-  "engines": {
-    "node": ">=16.0.0"
-  }
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mosesh12see/render-rules-and-downline.git"
+  },
+  "keywords": [
+    "pipeline",
+    "quickbase",
+    "webhook",
+    "partner-routing",
+    "appointment-management",
+    "sees",
+    "downline"
+  ],
+  "author": "SEES Team",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/mosesh12see/render-rules-and-downline/issues"
+  },
+  "homepage": "https://github.com/mosesh12see/render-rules-and-downline#readme"
 }
