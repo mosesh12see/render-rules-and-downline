@@ -1,6 +1,5 @@
-// SEES Pipeline Server - Fully Configurable via Environment Variables
-// All partner routing, hub assignments, and business rules are controlled through env vars
-// Deploy on Render and manage everything from the dashboard
+// SEES Pipeline Server with Podio Integration
+// Pulls appointments from Podio Closer app and processes through pipeline logic
 
 const express = require('express');
 const axios = require('axios');
@@ -14,14 +13,18 @@ app.use(express.urlencoded({ extended: true }));
 // ============================================
 // ENVIRONMENT VARIABLE CONFIGURATION
 // ============================================
-// All configuration is read from environment variables
-// This allows complete control from Render dashboard without code changes
-
 const CONFIG = {
   // Core Quickbase Configuration
   QB_REALM: process.env.QUICKBASE_REALM || 'generationsolar.quickbase.com',
   QB_TOKEN: process.env.QUICKBASE_TOKEN || 'b6qaq4_pywt_0_d4jy93kcjrtektcgv59xvmwv7xp',
   QB_APP_ID: process.env.QUICKBASE_APP_ID || 'bvd8uwsd6',
+  
+  // Podio Configuration
+  PODIO_CLIENT_ID: process.env.PODIO_CLIENT_ID || 'gpt-operator',
+  PODIO_CLIENT_SECRET: process.env.PODIO_CLIENT_SECRET || 'yn58tFMJO0HR8JRnUgKOWKph5FEq1Fn3WgWA4NA7oS4pMSSHmAuXTpxcE6hHtwPB',
+  PODIO_APP_ID: process.env.PODIO_APP_ID || '29175634',
+  PODIO_APP_TOKEN: process.env.PODIO_APP_TOKEN || '117d3fca26a11d72e48dc62e07d2e793',
+  PODIO_VIEW_ID: process.env.PODIO_VIEW_ID || '', // Will fetch "View for Zaps ALL for Future"
   
   // Google Maps API
   GOOGLE_MAPS_API: process.env.GOOGLE_MAPS_API || 'AIzaSyBVezgyoAm_oSwU2nd9XHLd-oS1kB7WWGI',
@@ -30,55 +33,231 @@ const CONFIG = {
   PORT: process.env.PORT || 3000,
   TIMEZONE: process.env.TIMEZONE || 'America/Los_Angeles',
   
-  // Business Rules - Thresholds and Limits
+  // Sync Settings
+  SYNC_INTERVAL_MINUTES: parseInt(process.env.SYNC_INTERVAL_MINUTES || '5'),
+  SYNC_ENABLED: process.env.SYNC_ENABLED !== 'false',
+  
+  // Business Rules
   MAX_DAILY_APPOINTMENTS: parseInt(process.env.MAX_DAILY_APPOINTMENTS || '100'),
   ESCALATION_MINUTES: parseInt(process.env.ESCALATION_MINUTES || '15'),
   ESCALATION_ROUNDS: parseInt(process.env.ESCALATION_ROUNDS || '3'),
   PREVIEW_WINDOW_MINUTES: parseInt(process.env.PREVIEW_WINDOW_MINUTES || '15'),
-  CLAIM_EXPIRY_HOURS: parseInt(process.env.CLAIM_EXPIRY_HOURS || '24'),
   
-  // Notification Settings
-  SEND_SMS_NOTIFICATIONS: process.env.SEND_SMS_NOTIFICATIONS === 'true',
-  SEND_EMAIL_NOTIFICATIONS: process.env.SEND_EMAIL_NOTIFICATIONS === 'true',
-  NOTIFICATION_DELAY_SECONDS: parseInt(process.env.NOTIFICATION_DELAY_SECONDS || '0'),
-  
-  // Routing Rules
-  ENABLE_ILLINOIS_OVERRIDE: process.env.ENABLE_ILLINOIS_OVERRIDE !== 'false', // Default true
-  DEFAULT_HUB: process.env.DEFAULT_HUB || 'STL_MO',
-  FALLBACK_HUB: process.env.FALLBACK_HUB || 'KC_MO',
-  
-  // Table IDs (can be overridden if needed)
+  // Table IDs
   TABLE_APPOINTMENTS: process.env.TABLE_APPOINTMENTS || 'bvd8uws2t',
   TABLE_CLAIMS: process.env.TABLE_CLAIMS || 'bvd8uwtki',
   TABLE_HUBS: process.env.TABLE_HUBS || 'bvd8uwsk4',
   TABLE_PARTNERS: process.env.TABLE_PARTNERS || 'bvd8uwst2',
   TABLE_PREVIEW_ROUNDS: process.env.TABLE_PREVIEW_ROUNDS || 'bvd8uwtau',
   TABLE_PARTNER_HUB_ASSIGNMENTS: process.env.TABLE_PARTNER_HUB_ASSIGNMENTS || 'bvd83xibr',
-  
-  // Cron Schedule (can be customized)
-  ESCALATION_CRON: process.env.ESCALATION_CRON || '*/15 * * * *', // Every 15 minutes
-  DAILY_RESET_CRON: process.env.DAILY_RESET_CRON || '0 0 * * *',  // Midnight daily
-  HEALTH_CHECK_CRON: process.env.HEALTH_CHECK_CRON || '*/5 * * * *', // Every 5 minutes
 };
 
 // ============================================
-// DYNAMIC PARTNER CONFIGURATION
+// PODIO AUTHENTICATION & CLIENT
 // ============================================
-// Partners are configured via environment variables:
-// PARTNER_1_NAME=PartnerName
-// PARTNER_1_HUBS=STL_MO,KC_MO
-// PARTNER_1_CAPACITY=50
-// PARTNER_1_PRIORITY=1
-// PARTNER_1_SPECIALTIES=solar,residential
-// PARTNER_1_ACTIVE=true
+let podioAccessToken = null;
+let podioTokenExpiry = null;
 
+async function authenticatePodio() {
+  try {
+    const response = await axios.post('https://podio.com/oauth/token', 
+      new URLSearchParams({
+        grant_type: 'app',
+        app_id: CONFIG.PODIO_APP_ID,
+        app_token: CONFIG.PODIO_APP_TOKEN,
+        client_id: CONFIG.PODIO_CLIENT_ID,
+        client_secret: CONFIG.PODIO_CLIENT_SECRET
+      }), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      }
+    );
+    
+    podioAccessToken = response.data.access_token;
+    podioTokenExpiry = Date.now() + (response.data.expires_in * 1000);
+    console.log('✅ Podio authentication successful');
+    return podioAccessToken;
+  } catch (error) {
+    console.error('❌ Podio authentication failed:', error.response?.data || error.message);
+    throw error;
+  }
+}
+
+async function ensurePodioAuth() {
+  if (!podioAccessToken || Date.now() >= podioTokenExpiry - 60000) {
+    await authenticatePodio();
+  }
+  return podioAccessToken;
+}
+
+// ============================================
+// PODIO VIEW FETCHING
+// ============================================
+async function getPodioViewId() {
+  const token = await ensurePodioAuth();
+  
+  try {
+    // Get all views for the app
+    const response = await axios.get(
+      `https://api.podio.com/view/app/${CONFIG.PODIO_APP_ID}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      }
+    );
+    
+    // Find "View for Zaps ALL for Future"
+    const targetView = response.data.find(view => 
+      view.name === 'View for Zaps ALL for Future' ||
+      view.name.includes('Zaps ALL for Future')
+    );
+    
+    if (targetView) {
+      console.log(`✅ Found view: ${targetView.name} (ID: ${targetView.view_id})`);
+      return targetView.view_id;
+    }
+    
+    // Fallback to first available view
+    if (response.data.length > 0) {
+      console.log(`⚠️ Using fallback view: ${response.data[0].name}`);
+      return response.data[0].view_id;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('❌ Error fetching Podio views:', error.message);
+    return null;
+  }
+}
+
+// ============================================
+// FETCH APPOINTMENTS FROM PODIO
+// ============================================
+async function fetchPodioAppointments() {
+  const token = await ensurePodioAuth();
+  
+  try {
+    // Get view ID if not set
+    let viewId = CONFIG.PODIO_VIEW_ID;
+    if (!viewId) {
+      viewId = await getPodioViewId();
+      if (!viewId) {
+        console.log('⚠️ No view found, fetching all items');
+      }
+    }
+    
+    // Fetch items from view or all items
+    const endpoint = viewId 
+      ? `https://api.podio.com/item/app/${CONFIG.PODIO_APP_ID}/filter/${viewId}`
+      : `https://api.podio.com/item/app/${CONFIG.PODIO_APP_ID}/filter`;
+    
+    const response = await axios.post(endpoint, 
+      {
+        limit: 100,
+        offset: 0,
+        sort_by: 'created_on',
+        sort_desc: true
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    console.log(`📥 Fetched ${response.data.items.length} appointments from Podio`);
+    return response.data.items;
+  } catch (error) {
+    console.error('❌ Error fetching Podio appointments:', error.response?.data || error.message);
+    return [];
+  }
+}
+
+// ============================================
+// PROCESS PODIO APPOINTMENT
+// ============================================
+async function processPodioAppointment(podioItem) {
+  try {
+    // Extract fields from Podio item
+    const fields = {};
+    podioItem.fields.forEach(field => {
+      fields[field.external_id] = field.values?.[0]?.value || field.values?.[0];
+    });
+    
+    // Map Podio fields to Quickbase
+    const appointmentData = {
+      6: { value: fields['customer-name'] || fields['name'] || 'Unknown' },
+      7: { value: fields['customer-address'] || fields['address'] || '' },
+      8: { value: fields['notes'] || fields['comments'] || '' },
+      9: { value: 'New' },
+      10: { value: 'Podio' },
+      11: { value: '' }, // Hub - will be assigned
+      12: { value: '' }, // Partner - will be assigned
+      13: { value: podioItem.item_id.toString() }, // Podio Item ID for tracking
+      14: { value: fields['appointment-date'] || new Date().toISOString() }
+    };
+    
+    // Check if already exists in Quickbase
+    const existing = await searchRecords(CONFIG.TABLE_APPOINTMENTS, `{13.EX.'${podioItem.item_id}'}`);
+    
+    if (existing.length > 0) {
+      console.log(`⏭️ Appointment ${podioItem.item_id} already exists, skipping`);
+      return null;
+    }
+    
+    // Create in Quickbase
+    const result = await createRecord(CONFIG.TABLE_APPOINTMENTS, appointmentData);
+    
+    if (result.data && result.data[0]) {
+      const appointmentId = result.data[0]['3'].value;
+      console.log(`✅ Created appointment ${appointmentId} from Podio item ${podioItem.item_id}`);
+      
+      // Trigger hub and partner assignment
+      await assignHubAndPartners(appointmentId, fields['customer-address'] || '');
+      
+      return appointmentId;
+    }
+  } catch (error) {
+    console.error(`❌ Error processing Podio item ${podioItem.item_id}:`, error.message);
+    return null;
+  }
+}
+
+// ============================================
+// SYNC PODIO TO QUICKBASE
+// ============================================
+async function syncPodioToQuickbase() {
+  console.log('🔄 Starting Podio sync...');
+  
+  try {
+    const appointments = await fetchPodioAppointments();
+    let created = 0;
+    
+    for (const appointment of appointments) {
+      const result = await processPodioAppointment(appointment);
+      if (result) created++;
+    }
+    
+    console.log(`✅ Sync complete: ${created} new appointments created`);
+    return { total: appointments.length, created };
+  } catch (error) {
+    console.error('❌ Sync failed:', error.message);
+    return { error: error.message };
+  }
+}
+
+// ============================================
+// PARTNER CONFIGURATION (same as before)
+// ============================================
 function loadPartnerConfig() {
   const partners = [];
   
-  // Load up to 100 partners from environment variables
   for (let i = 1; i <= 100; i++) {
     const name = process.env[`PARTNER_${i}_NAME`];
-    if (!name) continue; // Skip if partner doesn't exist
+    if (!name) continue;
     
     partners.push({
       id: i,
@@ -86,36 +265,19 @@ function loadPartnerConfig() {
       hubs: (process.env[`PARTNER_${i}_HUBS`] || '').split(',').map(h => h.trim()),
       capacity: parseInt(process.env[`PARTNER_${i}_CAPACITY`] || '20'),
       priority: parseInt(process.env[`PARTNER_${i}_PRIORITY`] || '5'),
-      specialties: (process.env[`PARTNER_${i}_SPECIALTIES`] || '').split(',').map(s => s.trim()),
       active: process.env[`PARTNER_${i}_ACTIVE`] !== 'false',
-      phone: process.env[`PARTNER_${i}_PHONE`] || '',
-      email: process.env[`PARTNER_${i}_EMAIL`] || '',
-      maxDistance: parseInt(process.env[`PARTNER_${i}_MAX_DISTANCE`] || '50'),
-      currentLoad: 0 // Track daily appointments
+      currentLoad: 0
     });
   }
   
-  // Sort by priority (lower number = higher priority)
   partners.sort((a, b) => a.priority - b.priority);
-  
   console.log(`📋 Loaded ${partners.length} partners from environment`);
   return partners;
 }
 
-// ============================================
-// DYNAMIC HUB CONFIGURATION
-// ============================================
-// Hubs are configured via environment variables:
-// HUB_1_NAME=STL_MO
-// HUB_1_ADDRESS=123 Main St, St Louis, MO
-// HUB_1_PARTNERS=Partner1,Partner2,Partner3
-// HUB_1_ACTIVE=true
-// HUB_1_CAPACITY=100
-
 function loadHubConfig() {
   const hubs = [];
   
-  // Load up to 50 hubs from environment variables
   for (let i = 1; i <= 50; i++) {
     const name = process.env[`HUB_${i}_NAME`];
     if (!name) continue;
@@ -127,9 +289,6 @@ function loadHubConfig() {
       partners: (process.env[`HUB_${i}_PARTNERS`] || '').split(',').map(p => p.trim()),
       active: process.env[`HUB_${i}_ACTIVE`] !== 'false',
       capacity: parseInt(process.env[`HUB_${i}_CAPACITY`] || '100'),
-      timezone: process.env[`HUB_${i}_TIMEZONE`] || CONFIG.TIMEZONE,
-      manager: process.env[`HUB_${i}_MANAGER`] || '',
-      managerEmail: process.env[`HUB_${i}_MANAGER_EMAIL`] || '',
       currentLoad: 0
     });
   }
@@ -138,66 +297,8 @@ function loadHubConfig() {
   return hubs;
 }
 
-// Load configurations
 let PARTNERS = loadPartnerConfig();
 let HUBS = loadHubConfig();
-
-// ============================================
-// HELPER FUNCTIONS
-// ============================================
-
-// Get partners assigned to a specific hub
-function getPartnersForHub(hubName) {
-  // First check hub-specific partner list
-  const hub = HUBS.find(h => h.name === hubName);
-  if (hub && hub.partners.length > 0) {
-    return PARTNERS.filter(p => hub.partners.includes(p.name) && p.active);
-  }
-  
-  // Fall back to partners that list this hub
-  return PARTNERS.filter(p => p.hubs.includes(hubName) && p.active);
-}
-
-// Get partner capacity remaining for today
-function getPartnerCapacity(partnerName) {
-  const partner = PARTNERS.find(p => p.name === partnerName);
-  if (!partner) return 0;
-  return Math.max(0, partner.capacity - partner.currentLoad);
-}
-
-// Check if appointment should be escalated
-function shouldEscalate(appointmentCreatedTime) {
-  const ageInMinutes = (Date.now() - new Date(appointmentCreatedTime).getTime()) / 60000;
-  return ageInMinutes >= CONFIG.ESCALATION_MINUTES;
-}
-
-// Get next available partner for a hub
-function getNextAvailablePartner(hubName, roundNumber = 1) {
-  const partners = getPartnersForHub(hubName);
-  
-  // Filter by capacity
-  const availablePartners = partners.filter(p => getPartnerCapacity(p.name) > 0);
-  
-  // Return partners for the current round (3 per round)
-  const startIndex = (roundNumber - 1) * 3;
-  return availablePartners.slice(startIndex, startIndex + 3);
-}
-
-// Increment partner load
-function incrementPartnerLoad(partnerName) {
-  const partner = PARTNERS.find(p => p.name === partnerName);
-  if (partner) {
-    partner.currentLoad++;
-    console.log(`📈 ${partnerName} load: ${partner.currentLoad}/${partner.capacity}`);
-  }
-}
-
-// Reset daily loads (called at midnight)
-function resetDailyLoads() {
-  PARTNERS.forEach(p => p.currentLoad = 0);
-  HUBS.forEach(h => h.currentLoad = 0);
-  console.log('🔄 Daily loads reset');
-}
 
 // ============================================
 // QUICKBASE API CLIENT
@@ -211,7 +312,6 @@ const qbApi = axios.create({
   }
 });
 
-// Create record in Quickbase
 async function createRecord(tableId, data) {
   try {
     const response = await qbApi.post('/records', {
@@ -225,7 +325,19 @@ async function createRecord(tableId, data) {
   }
 }
 
-// Update record in Quickbase
+async function searchRecords(tableId, query) {
+  try {
+    const response = await qbApi.post('/records/query', {
+      from: tableId,
+      where: query
+    });
+    return response.data.data;
+  } catch (error) {
+    console.error(`❌ Error searching records:`, error.response?.data || error.message);
+    return [];
+  }
+}
+
 async function updateRecord(tableId, recordId, data) {
   try {
     const response = await qbApi.post('/records', {
@@ -242,98 +354,88 @@ async function updateRecord(tableId, recordId, data) {
   }
 }
 
-// Search records in Quickbase
-async function searchRecords(tableId, query) {
-  try {
-    const response = await qbApi.post('/records/query', {
-      from: tableId,
-      where: query
+// ============================================
+// HUB AND PARTNER ASSIGNMENT
+// ============================================
+async function assignHubAndPartners(appointmentId, address) {
+  console.log(`🗺️ Assigning hub and partners for appointment ${appointmentId}`);
+  
+  let assignedHub = CONFIG.DEFAULT_HUB || 'STL_MO';
+  
+  // Illinois override
+  if (address && (address.includes('IL') || address.includes('Illinois'))) {
+    assignedHub = 'STL_IL';
+  }
+  
+  // Get available partners
+  const partners = getPartnersForHub(assignedHub);
+  const availablePartners = partners.filter(p => 
+    p.currentLoad < p.capacity
+  ).slice(0, 3);
+  
+  // Update appointment with hub
+  await updateRecord(CONFIG.TABLE_APPOINTMENTS, appointmentId, {
+    11: { value: assignedHub },
+    9: { value: 'Previewing' }
+  });
+  
+  // Create preview rounds
+  for (const partner of availablePartners) {
+    await createRecord(CONFIG.TABLE_PREVIEW_ROUNDS, {
+      6: { value: appointmentId },
+      7: { value: partner.name },
+      8: { value: 'Active' },
+      9: { value: new Date().toISOString() },
+      10: { value: new Date(Date.now() + CONFIG.PREVIEW_WINDOW_MINUTES * 60000).toISOString() },
+      11: { value: 1 },
+      12: { value: assignedHub }
     });
-    return response.data.data;
-  } catch (error) {
-    console.error(`❌ Error searching records:`, error.response?.data || error.message);
-    return [];
   }
 }
 
-// ============================================
-// CONFIGURATION ENDPOINT
-// ============================================
-app.get('/config', (req, res) => {
-  // Show current configuration (sanitized - no tokens)
-  const safeConfig = {
-    realm: CONFIG.QB_REALM,
-    appId: CONFIG.QB_APP_ID,
-    timezone: CONFIG.TIMEZONE,
-    rules: {
-      maxDailyAppointments: CONFIG.MAX_DAILY_APPOINTMENTS,
-      escalationMinutes: CONFIG.ESCALATION_MINUTES,
-      escalationRounds: CONFIG.ESCALATION_ROUNDS,
-      previewWindowMinutes: CONFIG.PREVIEW_WINDOW_MINUTES,
-      claimExpiryHours: CONFIG.CLAIM_EXPIRY_HOURS,
-      illinoisOverride: CONFIG.ENABLE_ILLINOIS_OVERRIDE,
-      defaultHub: CONFIG.DEFAULT_HUB
-    },
-    partners: PARTNERS.map(p => ({
-      name: p.name,
-      hubs: p.hubs,
-      capacity: p.capacity,
-      currentLoad: p.currentLoad,
-      available: p.capacity - p.currentLoad,
-      priority: p.priority,
-      active: p.active
-    })),
-    hubs: HUBS.map(h => ({
-      name: h.name,
-      partners: h.partners,
-      capacity: h.capacity,
-      currentLoad: h.currentLoad,
-      active: h.active
-    })),
-    schedules: {
-      escalation: CONFIG.ESCALATION_CRON,
-      dailyReset: CONFIG.DAILY_RESET_CRON,
-      healthCheck: CONFIG.HEALTH_CHECK_CRON
-    }
-  };
-  
-  res.json(safeConfig);
-});
+function getPartnersForHub(hubName) {
+  const hub = HUBS.find(h => h.name === hubName);
+  if (hub && hub.partners.length > 0) {
+    return PARTNERS.filter(p => hub.partners.includes(p.name) && p.active);
+  }
+  return PARTNERS.filter(p => p.hubs.includes(hubName) && p.active);
+}
 
 // ============================================
-// RELOAD CONFIGURATION ENDPOINT
+// ENDPOINTS
 // ============================================
-app.post('/config/reload', (req, res) => {
-  // Reload partner and hub configurations from environment
-  PARTNERS = loadPartnerConfig();
-  HUBS = loadHubConfig();
-  
+
+// Manual sync trigger
+app.post('/sync/podio', async (req, res) => {
+  const result = await syncPodioToQuickbase();
+  res.json(result);
+});
+
+// Get sync status
+app.get('/sync/status', async (req, res) => {
   res.json({
-    success: true,
-    message: 'Configuration reloaded',
-    partners: PARTNERS.length,
-    hubs: HUBS.length
+    podio: {
+      authenticated: !!podioAccessToken,
+      tokenExpiry: podioTokenExpiry ? new Date(podioTokenExpiry).toISOString() : null,
+      appId: CONFIG.PODIO_APP_ID,
+      syncEnabled: CONFIG.SYNC_ENABLED,
+      syncInterval: `${CONFIG.SYNC_INTERVAL_MINUTES} minutes`
+    },
+    quickbase: {
+      realm: CONFIG.QB_REALM,
+      appId: CONFIG.QB_APP_ID
+    },
+    lastSync: lastSyncTime || 'Never'
   });
 });
 
-// ============================================
-// WEBHOOK: SLACK INTAKE
-// ============================================
+// Webhook for Slack (kept for compatibility)
 app.post('/webhook/slack-intake', async (req, res) => {
   console.log('📥 Slack intake webhook triggered');
   
   try {
     const text = req.body.text || '';
     const parts = text.split('|').map(p => p.trim());
-    
-    // Check daily limit
-    const totalAppointmentsToday = HUBS.reduce((sum, h) => sum + h.currentLoad, 0);
-    if (totalAppointmentsToday >= CONFIG.MAX_DAILY_APPOINTMENTS) {
-      return res.json({
-        response_type: 'ephemeral',
-        text: `⚠️ Daily appointment limit reached (${CONFIG.MAX_DAILY_APPOINTMENTS})`
-      });
-    }
     
     const appointmentData = {
       6: { value: parts[0] || 'Unknown' },
@@ -362,71 +464,12 @@ app.post('/webhook/slack-intake', async (req, res) => {
   }
 });
 
-// ============================================
-// HUB AND PARTNER ASSIGNMENT
-// ============================================
-async function assignHubAndPartners(appointmentId, address) {
-  console.log(`🗺️ Assigning hub and partners for appointment ${appointmentId}`);
-  
-  // Determine hub based on address
-  let assignedHub = CONFIG.DEFAULT_HUB;
-  
-  // Illinois override
-  if (CONFIG.ENABLE_ILLINOIS_OVERRIDE && address) {
-    if (address.includes('IL') || address.includes('Illinois')) {
-      assignedHub = 'STL_IL';
-    }
-  }
-  
-  // Get available partners for this hub
-  const availablePartners = getNextAvailablePartner(assignedHub, 1);
-  
-  if (availablePartners.length === 0) {
-    console.log(`⚠️ No available partners for hub ${assignedHub}`);
-    assignedHub = CONFIG.FALLBACK_HUB;
-  }
-  
-  // Update appointment with hub
-  await updateRecord(CONFIG.TABLE_APPOINTMENTS, appointmentId, {
-    11: { value: assignedHub },
-    9: { value: 'Previewing' }
-  });
-  
-  // Create preview rounds for available partners
-  for (const partner of availablePartners) {
-    await createRecord(CONFIG.TABLE_PREVIEW_ROUNDS, {
-      6: { value: appointmentId },
-      7: { value: partner.name },
-      8: { value: 'Active' },
-      9: { value: new Date().toISOString() },
-      10: { value: new Date(Date.now() + CONFIG.PREVIEW_WINDOW_MINUTES * 60000).toISOString() },
-      11: { value: 1 },
-      12: { value: assignedHub }
-    });
-  }
-  
-  // Increment hub load
-  const hub = HUBS.find(h => h.name === assignedHub);
-  if (hub) hub.currentLoad++;
-}
-
-// ============================================
-// WEBHOOK: PROCESS CLAIM
-// ============================================
+// Webhook for claims
 app.post('/webhook/claim', async (req, res) => {
   console.log('🎯 Claim webhook triggered');
   
   try {
-    const { appointment_id, partner_name, preview_round_id } = req.body;
-    
-    // Check partner capacity
-    const capacity = getPartnerCapacity(partner_name);
-    if (capacity <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: `Partner ${partner_name} has reached daily capacity`
-      });
-    }
+    const { appointment_id, partner_name } = req.body;
     
     // Check if already claimed
     const existingClaims = await searchRecords(
@@ -456,12 +499,12 @@ app.post('/webhook/claim', async (req, res) => {
     });
     
     // Increment partner load
-    incrementPartnerLoad(partner_name);
+    const partner = PARTNERS.find(p => p.name === partner_name);
+    if (partner) partner.currentLoad++;
     
     res.json({
       success: true,
-      message: 'Claim approved',
-      partnerCapacityRemaining: getPartnerCapacity(partner_name)
+      message: 'Claim approved'
     });
   } catch (error) {
     console.error('❌ Claim error:', error);
@@ -469,12 +512,59 @@ app.post('/webhook/claim', async (req, res) => {
   }
 });
 
+// Configuration endpoint
+app.get('/config', (req, res) => {
+  res.json({
+    podio: {
+      appId: CONFIG.PODIO_APP_ID,
+      syncEnabled: CONFIG.SYNC_ENABLED,
+      syncInterval: CONFIG.SYNC_INTERVAL_MINUTES
+    },
+    quickbase: {
+      realm: CONFIG.QB_REALM,
+      appId: CONFIG.QB_APP_ID
+    },
+    partners: PARTNERS.map(p => ({
+      name: p.name,
+      hubs: p.hubs,
+      capacity: p.capacity,
+      currentLoad: p.currentLoad,
+      available: p.capacity - p.currentLoad
+    })),
+    hubs: HUBS.map(h => ({
+      name: h.name,
+      capacity: h.capacity,
+      currentLoad: h.currentLoad,
+      active: h.active
+    }))
+  });
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    podioConnected: !!podioAccessToken,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // ============================================
 // SCHEDULED TASKS
 // ============================================
+let lastSyncTime = null;
+
+// Sync from Podio every X minutes
+if (CONFIG.SYNC_ENABLED) {
+  cron.schedule(`*/${CONFIG.SYNC_INTERVAL_MINUTES} * * * *`, async () => {
+    console.log('⏰ Running scheduled Podio sync');
+    const result = await syncPodioToQuickbase();
+    lastSyncTime = new Date().toISOString();
+  });
+}
 
 // Escalation timer
-cron.schedule(CONFIG.ESCALATION_CRON, async () => {
+cron.schedule('*/15 * * * *', async () => {
   console.log('⏰ Running escalation check');
   
   try {
@@ -484,32 +574,13 @@ cron.schedule(CONFIG.ESCALATION_CRON, async () => {
     );
     
     for (const round of activeRounds) {
-      if (shouldEscalate(round['9']?.value)) {
-        // Mark as expired
+      const createdTime = new Date(round['9']?.value);
+      const ageInMinutes = (Date.now() - createdTime) / 60000;
+      
+      if (ageInMinutes >= CONFIG.ESCALATION_MINUTES) {
         await updateRecord(CONFIG.TABLE_PREVIEW_ROUNDS, round['3'].value, {
           8: { value: 'Expired' }
         });
-        
-        // Create next round if under max rounds
-        const roundNumber = parseInt(round['11']?.value || '1');
-        if (roundNumber < CONFIG.ESCALATION_ROUNDS) {
-          const nextPartners = getNextAvailablePartner(
-            round['12']?.value,
-            roundNumber + 1
-          );
-          
-          for (const partner of nextPartners) {
-            await createRecord(CONFIG.TABLE_PREVIEW_ROUNDS, {
-              6: { value: round['6']?.value },
-              7: { value: partner.name },
-              8: { value: 'Active' },
-              9: { value: new Date().toISOString() },
-              10: { value: new Date(Date.now() + CONFIG.PREVIEW_WINDOW_MINUTES * 60000).toISOString() },
-              11: { value: roundNumber + 1 },
-              12: { value: round['12']?.value }
-            });
-          }
-        }
       }
     }
   } catch (error) {
@@ -518,109 +589,55 @@ cron.schedule(CONFIG.ESCALATION_CRON, async () => {
 });
 
 // Daily reset
-cron.schedule(CONFIG.DAILY_RESET_CRON, () => {
+cron.schedule('0 0 * * *', () => {
   console.log('🌅 Running daily reset');
-  resetDailyLoads();
-});
-
-// Health check
-cron.schedule(CONFIG.HEALTH_CHECK_CRON, async () => {
-  try {
-    // Simple query to verify Quickbase connection
-    await searchRecords(CONFIG.TABLE_APPOINTMENTS, "{3.GT.0}");
-    console.log('💚 Health check passed');
-  } catch (error) {
-    console.error('💔 Health check failed:', error.message);
-  }
-});
-
-// ============================================
-// MONITORING ENDPOINTS
-// ============================================
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    partners: PARTNERS.length,
-    hubs: HUBS.length
-  });
-});
-
-app.get('/status', (req, res) => {
-  const totalCapacity = PARTNERS.reduce((sum, p) => sum + p.capacity, 0);
-  const totalLoad = PARTNERS.reduce((sum, p) => sum + p.currentLoad, 0);
-  
-  res.json({
-    system: {
-      uptime: process.uptime(),
-      memory: process.memoryUsage(),
-      timestamp: new Date().toISOString()
-    },
-    capacity: {
-      total: totalCapacity,
-      used: totalLoad,
-      available: totalCapacity - totalLoad,
-      percentage: ((totalLoad / totalCapacity) * 100).toFixed(2) + '%'
-    },
-    partners: PARTNERS.map(p => ({
-      name: p.name,
-      load: `${p.currentLoad}/${p.capacity}`,
-      available: p.capacity - p.currentLoad
-    })),
-    hubs: HUBS.map(h => ({
-      name: h.name,
-      load: h.currentLoad,
-      active: h.active
-    }))
-  });
+  PARTNERS.forEach(p => p.currentLoad = 0);
+  HUBS.forEach(h => h.currentLoad = 0);
 });
 
 // ============================================
 // SERVER STARTUP
 // ============================================
-const server = app.listen(CONFIG.PORT, () => {
+const server = app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════╗
-║   SEES PIPELINE SERVER - ENVIRONMENT CONFIGURED           ║
+║   SEES PIPELINE SERVER WITH PODIO INTEGRATION             ║
 ║   Port: ${CONFIG.PORT}                                           ║
 ╠════════════════════════════════════════════════════════════╣
-║   Configuration:                                           ║
-║   • Partners: ${PARTNERS.length} loaded                              ║
-║   • Hubs: ${HUBS.length} loaded                                  ║
-║   • Max Daily: ${CONFIG.MAX_DAILY_APPOINTMENTS}                            ║
-║   • Escalation: ${CONFIG.ESCALATION_MINUTES} minutes                      ║
-║   • Rounds: ${CONFIG.ESCALATION_ROUNDS}                                   ║
+║   Podio Configuration:                                     ║
+║   • App ID: ${CONFIG.PODIO_APP_ID}                                 ║
+║   • Sync Enabled: ${CONFIG.SYNC_ENABLED}                             ║
+║   • Sync Interval: ${CONFIG.SYNC_INTERVAL_MINUTES} minutes                    ║
+║   • View: View for Zaps ALL for Future                    ║
+╠════════════════════════════════════════════════════════════╣
+║   Partners: ${PARTNERS.length} loaded                                 ║
+║   Hubs: ${HUBS.length} loaded                                     ║
 ╠════════════════════════════════════════════════════════════╣
 ║   Endpoints:                                               ║
-║   GET  /config - View current configuration               ║
-║   POST /config/reload - Reload from environment           ║
-║   POST /webhook/slack-intake - New appointments           ║
+║   POST /sync/podio - Manual sync trigger                  ║
+║   GET  /sync/status - Sync status                         ║
+║   POST /webhook/slack-intake - Slack appointments         ║
 ║   POST /webhook/claim - Process claims                    ║
+║   GET  /config - View configuration                       ║
 ║   GET  /health - Health check                             ║
-║   GET  /status - System status                            ║
-╠════════════════════════════════════════════════════════════╣
-║   Scheduled Tasks:                                        ║
-║   • Escalation: ${CONFIG.ESCALATION_CRON}                         ║
-║   • Daily Reset: ${CONFIG.DAILY_RESET_CRON}                          ║
-║   • Health Check: ${CONFIG.HEALTH_CHECK_CRON}                        ║
 ╚════════════════════════════════════════════════════════════╝
   `);
   
-  // Show loaded partners
-  console.log('\n📋 LOADED PARTNERS:');
-  PARTNERS.forEach(p => {
-    console.log(`   • ${p.name}: Capacity ${p.capacity}, Hubs: ${p.hubs.join(', ')}`);
-  });
-  
-  console.log('\n🏢 LOADED HUBS:');
-  HUBS.forEach(h => {
-    console.log(`   • ${h.name}: ${h.partners.length} partners, Capacity: ${h.capacity}`);
-  });
+  // Initial Podio authentication
+  try {
+    await authenticatePodio();
+    console.log('✅ Connected to Podio');
+    
+    // Run initial sync
+    if (CONFIG.SYNC_ENABLED) {
+      console.log('🔄 Running initial sync...');
+      await syncPodioToQuickbase();
+    }
+  } catch (error) {
+    console.error('⚠️ Failed to connect to Podio:', error.message);
+  }
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('📛 Shutting down gracefully...');
   server.close(() => {
